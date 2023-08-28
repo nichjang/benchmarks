@@ -47,11 +47,11 @@ func insertRow(ctx context.Context, inserter *bigquery.Inserter, row *LatencyRow
 
 func main() {
 	projectID := "cps-devel"
-	spannerInstanceID := "spanner-test"
-	spannerDatabaseID := "test"
-	spannerStreamID := "flink_resource_cdc"
+	spannerInstanceID := "spanner-benchmark"
+	spannerDatabaseID := "benchmark-db"
+	spannerStreamID := "pkc_benchmark_cdc"
 	bigqueryDatasetID := "spanner_benchmark"
-	bigqueryTableID := "flink_resource_latency"
+	bigqueryTableID := "pkc_latency"
 
 	ctx := context.Background()
 	reader, err := changestreams.NewReader(ctx, projectID, spannerInstanceID, spannerDatabaseID, spannerStreamID)
