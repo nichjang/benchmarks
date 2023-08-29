@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"runtime"
+	"sync"
 	"time"
 
 	"cloud.google.com/go/bigquery"
@@ -13,6 +15,10 @@ import (
 
 const (
 	ModTypeDelete = "DELETE"
+)
+
+var (
+	wg = &sync.WaitGroup{}
 )
 
 // LatencyRow represents a row in BigQuery.
@@ -56,8 +62,79 @@ func createBigQueryInserter(projectID, datasetID, tableID string) (*bigquery.Ins
 	return client.Dataset(datasetID).Table(tableID).Inserter(), nil
 }
 
-func insertRow(ctx context.Context, inserter *bigquery.Inserter, row *LatencyRow) error {
-	if err := inserter.Put(ctx, row); err != nil {
+func processRecord(dcr *changestreams.DataChangeRecord) *LatencyRow {
+	timeSinceCommit := time.Since(dcr.CommitTimestamp)
+
+	latencyRow := &LatencyRow{
+		OperationType:      dcr.ModType,
+		LatencySinceCommit: timeSinceCommit.Milliseconds(),
+		CommitTime:         dcr.CommitTimestamp,
+	}
+
+	if dcr.ModType != ModTypeDelete && len(dcr.Mods) > 0 {
+		data := PhysicalCluster{}
+		json.Unmarshal([]byte(dcr.Mods[0].NewValues.String()), &data)
+
+		timeSinceModified := time.Since(data.Modified)
+
+		// fmt.Printf("The latency from modified is %v\n", time.Since(data.Modified))
+		latencyRow.LatencySinceModified = timeSinceModified.Milliseconds()
+		latencyRow.ModifiedTime = data.Modified
+	}
+
+	return latencyRow
+}
+
+type ChangeStreamProducer struct {
+	rowChannel *chan *LatencyRow
+	reader     *changestreams.Reader
+}
+
+// produce produces messages from Spanner change stream to row channel
+func (p *ChangeStreamProducer) produce(ctx context.Context) {
+	defer wg.Done()
+
+	fmt.Println("ChangeStreamProducer start producing messages")
+	if err := p.reader.Read(ctx, func(result *changestreams.ReadResult) error {
+		for _, cr := range result.ChangeRecords {
+			for _, dcr := range cr.DataChangeRecords {
+				// now := time.Now()
+
+				row := processRecord(dcr)
+
+				*p.rowChannel <- row
+
+				// fmt.Println("time to process record %v\n", time.Since(now))
+			}
+		}
+
+		return nil
+	}); err != nil {
+		log.Fatalf("failed to read: %v", err)
+	}
+}
+
+type BigQueryConsumer struct {
+	rowChannel *chan *LatencyRow
+	bqInserter *bigquery.Inserter
+}
+
+// consume reads the channel and uploads to bigquery
+func (c *BigQueryConsumer) consume(ctx context.Context) {
+	defer wg.Done()
+
+	fmt.Println("BigQueryConsumer start recieving messages")
+	for {
+		row := <-*c.rowChannel
+		err := c.insertRow(ctx, row)
+		if err != nil {
+			fmt.Printf("Err inserting into bq: %v\n", err)
+		}
+	}
+}
+
+func (c *BigQueryConsumer) insertRow(ctx context.Context, row *LatencyRow) error {
+	if err := c.bqInserter.Put(ctx, row); err != nil {
 		return err
 	}
 	return nil
@@ -71,6 +148,10 @@ func main() {
 	bigqueryDatasetID := "spanner_benchmark"
 	bigqueryTableID := "pkc_latency"
 
+	runtime.GOMAXPROCS(runtime.NumCPU())
+
+	rowChannel := make(chan *LatencyRow, 1000) // channel for rows
+
 	ctx := context.Background()
 	reader, err := changestreams.NewReader(ctx, projectID, spannerInstanceID, spannerDatabaseID, spannerStreamID)
 	if err != nil {
@@ -83,40 +164,14 @@ func main() {
 		log.Fatalf("failed to create a bq inserter: %v", err)
 	}
 
+	csProducer := &ChangeStreamProducer{rowChannel: &rowChannel, reader: reader}
+	bqConsumer := &BigQueryConsumer{rowChannel: &rowChannel, bqInserter: bqInserter}
+
 	fmt.Println("connected to change stream")
 
-	if err := reader.Read(ctx, func(result *changestreams.ReadResult) error {
-		for _, cr := range result.ChangeRecords {
-			for _, dcr := range cr.DataChangeRecords {
-				// Calculate the difference between the two times
-				timeSinceCommit := time.Since(dcr.CommitTimestamp)
-
-				latencyRow := &LatencyRow{
-					OperationType:      dcr.ModType,
-					LatencySinceCommit: timeSinceCommit.Milliseconds(),
-					CommitTime:         dcr.CommitTimestamp,
-				}
-
-				if dcr.ModType != ModTypeDelete && len(dcr.Mods) > 0 {
-					data := PhysicalCluster{}
-					json.Unmarshal([]byte(dcr.Mods[0].NewValues.String()), &data)
-
-					timeSinceModified := time.Since(data.Modified)
-
-					// fmt.Printf("The latency from modified is %v\n", time.Since(data.Modified))
-					latencyRow.LatencySinceModified = timeSinceModified.Milliseconds()
-					latencyRow.ModifiedTime = data.Modified
-				}
-
-				// insert into bigquery
-				err = insertRow(ctx, bqInserter, latencyRow)
-				if err != nil {
-					fmt.Printf("Err inserting into bq: %v\n", err)
-				}
-			}
-		}
-		return nil
-	}); err != nil {
-		log.Fatalf("failed to read: %v", err)
-	}
+	wg.Add(1)
+	go csProducer.produce(ctx)
+	wg.Add(1)
+	go bqConsumer.consume(ctx)
+	wg.Wait()
 }
