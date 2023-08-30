@@ -15,6 +15,9 @@ import (
 
 const (
 	ModTypeDelete = "DELETE"
+
+	BUFFER_SIZE    = 100000
+	NUM_GOROUTINES = 100000
 )
 
 var (
@@ -124,8 +127,7 @@ func (c *BigQueryConsumer) consume(ctx context.Context) {
 	defer wg.Done()
 
 	fmt.Println("BigQueryConsumer start recieving messages")
-	for {
-		row := <-*c.rowChannel
+	for row := range *c.rowChannel {
 		err := c.insertRow(ctx, row)
 		if err != nil {
 			fmt.Printf("Err inserting into bq: %v\n", err)
@@ -146,11 +148,11 @@ func main() {
 	spannerDatabaseID := "benchmark-db"
 	spannerStreamID := "pkc_benchmark_cdc"
 	bigqueryDatasetID := "spanner_benchmark"
-	bigqueryTableID := "pkc_latency"
+	bigqueryTableID := "pkc_latency_new"
 
 	runtime.GOMAXPROCS(runtime.NumCPU())
 
-	rowChannel := make(chan *LatencyRow, 1000) // channel for rows
+	rowChannel := make(chan *LatencyRow, BUFFER_SIZE) // channel for rows
 
 	ctx := context.Background()
 	reader, err := changestreams.NewReader(ctx, projectID, spannerInstanceID, spannerDatabaseID, spannerStreamID)
@@ -171,7 +173,9 @@ func main() {
 
 	wg.Add(1)
 	go csProducer.produce(ctx)
-	wg.Add(1)
-	go bqConsumer.consume(ctx)
+	wg.Add(NUM_GOROUTINES)
+	for i := 0; i < NUM_GOROUTINES; i++ {
+		go bqConsumer.consume(ctx)
+	}
 	wg.Wait()
 }
