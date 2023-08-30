@@ -65,7 +65,7 @@ func createBigQueryInserter(projectID, datasetID, tableID string) (*bigquery.Ins
 	return client.Dataset(datasetID).Table(tableID).Inserter(), nil
 }
 
-func processRecord(dcr *changestreams.DataChangeRecord, rowChannel chan<- *LatencyRow) {
+func processRecord(dcr *changestreams.DataChangeRecord) *LatencyRow {
 	timeSinceCommit := time.Since(dcr.CommitTimestamp)
 
 	latencyRow := &LatencyRow{
@@ -85,7 +85,7 @@ func processRecord(dcr *changestreams.DataChangeRecord, rowChannel chan<- *Laten
 		latencyRow.ModifiedTime = data.Modified
 	}
 
-	rowChannel <- latencyRow
+	return latencyRow
 }
 
 type ChangeStreamProducer struct {
@@ -103,7 +103,9 @@ func (p *ChangeStreamProducer) produce(ctx context.Context) {
 			for _, dcr := range cr.DataChangeRecords {
 				// now := time.Now()
 
-				go processRecord(dcr, *p.rowChannel)
+				row := processRecord(dcr)
+
+				*p.rowChannel <- row
 
 				// fmt.Println("time to process record %v\n", time.Since(now))
 			}
@@ -124,7 +126,7 @@ type BigQueryConsumer struct {
 func (c *BigQueryConsumer) consume(ctx context.Context) {
 	defer wg.Done()
 
-	// fmt.Println("BigQueryConsumer start recieving messages")
+	fmt.Println("BigQueryConsumer start recieving messages")
 	for row := range *c.rowChannel {
 		err := c.insertRow(ctx, row)
 		if err != nil {
